@@ -170,3 +170,297 @@ class CacheManager:
     def get_streams(self, movie_id: str) -> List[sqlite3.Row]:
         with self._get_connection() as conn:
             return conn.execute("SELECT * FROM stream_links WHERE movie_id = ?", (movie_id,)).fetchall()
+# ==========================================
+# PART 2: Asynchronous API Client & Extraction
+# ==========================================
+
+class MovieBoxSession:
+    """Handles JWT Token parsing and expiration from session.rs"""
+    def __init__(self, token: str):
+        self.token = token
+        self.expires_at = self._parse_exp(token)
+        self.created_at = int(time.time())
+
+    def _parse_exp(self, token: str) -> Optional[int]:
+        try:
+            parts = token.split('.')
+            if len(parts) > 1:
+                payload = parts[1]
+                pad_len = (4 - (len(payload) % 4)) % 4
+                padded = payload + ("=" * pad_len)
+                decoded = base64.urlsafe_b64decode(padded)
+                val = json.loads(decoded)
+                return int(val.get("exp", 0))
+        except Exception:
+            pass
+        return None
+
+    def is_valid(self) -> bool:
+        if not self.token: return False
+        now = int(time.time())
+        if self.expires_at:
+            return now + 60 < self.expires_at
+        return now < self.created_at + (7 * 24 * 3600)
+
+
+class MovieBoxClient:
+    """Core HTTP Client translated from client.rs"""
+    HOST_POOL = [
+        "https://api6.aoneroom.com",
+        "https://api5.aoneroom.com",
+        "https://api4.aoneroom.com",
+        "https://api4sg.aoneroom.com",
+        "https://api3.aoneroom.com",
+        "https://api6sg.aoneroom.com",
+        "https://api.inmoviebox.com",
+    ]
+
+    def __init__(self):
+        self.active_idx = 0
+        self.session: Optional[MovieBoxSession] = None
+        self.client_info = MovieBoxCrypto.get_client_info()
+        self.spoofed_ip = MovieBoxCrypto.random_spoofed_ip()
+        self.user_agent = "com.community.oneroom/50020117 (Linux; U; Android 13; en_US; Redmi; Build/TQ2A.230405.003; Cronet/135.0.7012.3)"
+        self.semaphore = asyncio.Semaphore(3)
+
+    def _get_base_url(self) -> str:
+        return self.HOST_POOL[self.active_idx]
+
+    def _rotate_host(self):
+        self.active_idx = (self.active_idx + 1) % len(self.HOST_POOL)
+
+    async def ensure_session(self) -> str:
+        if self.session and self.session.is_valid():
+            return self.session.token
+            
+        path = "/wefeed-mobile-bff/user-api/visitor-login"
+        body_str = "{}"
+        ts_ms = int(time.time() * 1000)
+        url = self._get_base_url() + path
+        
+        headers = {
+            "User-Agent": self.user_agent,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Connection": "keep-alive",
+            "x-client-token": MovieBoxCrypto.generate_x_client_token(ts_ms),
+            "x-tr-signature": MovieBoxCrypto.generate_signature("POST", url, body_str, ts_ms),
+            "x-client-info": self.client_info,
+            "x-client-status": "0",
+            "x-forwarded-for": self.spoofed_ip,
+        }
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, data=body_str, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json().get("data", {}) if "data" in resp.json() else resp.json()
+                token = data.get("token")
+                if token:
+                    self.session = MovieBoxSession(token)
+                    return token
+        raise Exception("Failed to initialize visitor session")
+
+    async def request(self, method: str, path: str, body: Optional[dict] = None) -> dict:
+        async with self.semaphore:
+            token = await self.ensure_session()
+            body_str = json.dumps(body, separators=(',', ':')) if body else ""
+            
+            for _ in range(len(self.HOST_POOL)):
+                base_url = self._get_base_url()
+                full_url = base_url + path
+                ts_ms = int(time.time() * 1000)
+                
+                headers = {
+                    "User-Agent": self.user_agent,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}",
+                    "x-client-token": MovieBoxCrypto.generate_x_client_token(ts_ms),
+                    "x-tr-signature": MovieBoxCrypto.generate_signature(method, full_url, body_str, ts_ms),
+                    "x-client-info": self.client_info,
+                    "x-client-status": "0",
+                    "x-forwarded-for": self.spoofed_ip,
+                }
+                
+                try:
+                    async with httpx.AsyncClient(timeout=15.0) as client:
+                        if method == "POST":
+                            resp = await client.post(full_url, data=body_str, headers=headers)
+                        else:
+                            resp = await client.get(full_url, headers=headers)
+                            
+                        if resp.status_code in [403, 406, 407, 429, 500, 502, 503, 504]:
+                            self._rotate_host()
+                            continue
+                            
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            return data.get("data", data)
+                except Exception:
+                    self._rotate_host()
+                    continue
+            
+            raise Exception("All MovieBox API hosts exhausted or unreachable.")
+
+    # API Endpoints mapped from mod.rs & client.rs
+    async def search(self, query: str, page: int = 1) -> List[dict]:
+        payload = {"keyword": query, "page": page, "perPage": 15, "subjectType": 0}
+        data = await self.request("POST", "/wefeed-mobile-bff/subject-api/search/v2", payload)
+        return MovieBoxParser.parse_search(data)
+
+    async def get_details(self, subject_id: str) -> dict:
+        path = f"/wefeed-mobile-bff/subject-api/get?subjectId={subject_id}"
+        return await self.request("GET", path)
+
+    async def get_play_info(self, subject_id: str, season: int = 0, episode: int = 0) -> List[dict]:
+        if season == 0 and episode == 0:
+            path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}"
+        else:
+            path = f"/wefeed-mobile-bff/subject-api/play-info/v2?subjectId={subject_id}&se={season}&ep={episode}"
+        
+        data = await self.request("GET", path)
+        return MovieBoxParser.parse_play_info(data)
+
+
+class MovieBoxParser:
+    """Translates adapt.rs JSON parsing to Python dictionaries"""
+    @staticmethod
+    def parse_search(payload: dict) -> List[dict]:
+        items = []
+        results = payload.get("results", [])
+        if not results and "list" in payload:
+            results = payload.get("list", [])
+            
+        subjects = results[0].get("subjects", []) if results and "subjects" in results[0] else results
+        
+        for s in subjects:
+            id_str = str(s.get("subjectId", s.get("id", "")))
+            if not id_str: continue
+            
+            items.append({
+                "id": id_str,
+                "title": s.get("title", s.get("name", "Unknown")),
+                "type": "Series" if s.get("subjectType", s.get("stype")) == 2 else "Movie",
+                "year": s.get("releaseDate", s.get("year", ""))[:4],
+                "poster": s.get("cover", {}).get("url", "")
+            })
+        return items
+
+    @staticmethod
+    def parse_play_info(payload: dict) -> List[dict]:
+        streams = payload.get("streams", [])
+        releases = []
+        for s in streams:
+            quality = "1080p"
+            resolutions = s.get("resolutions", "")
+            if resolutions:
+                res_list = [int(r) for r in resolutions.split(",") if r.isdigit()]
+                if res_list:
+                    quality = f"{max(res_list)}p"
+            
+            releases.append({
+                "id": str(s.get("id", "")),
+                "quality": quality,
+                "codec": s.get("codecName", s.get("codec", "MP4")),
+                "url": s.get("url", ""),
+                "signCookie": s.get("signCookie", "")
+            })
+        return releases
+        # ==========================================
+# PART 3: The Textual User Interface (TUI)
+# ==========================================
+
+class MovieGoApp(App):
+    """Main Terminal Interface for MovieGo"""
+    
+    CSS = """
+    Screen {
+        background: #121212;
+        color: #e0e0e0;
+    }
+    #search_box {
+        margin: 1 2;
+        border: tall #00bcd4;
+        background: #1e1e1e;
+    }
+    #results_list {
+        margin: 0 2;
+        border: round #4caf50;
+        height: 1fr;
+        background: #121212;
+    }
+    ListItem {
+        padding: 1;
+        border-bottom: solid #333333;
+    }
+    ListItem:focus {
+        background: #2a2a2a;
+    }
+    """
+
+    BINDINGS = [
+        ("q", "quit", "Quit"),
+        ("c", "clear_cache", "Clear Cache")
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.client = MovieBoxClient()
+        self.cache = CacheManager()
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True, name="MovieGo (Termux)")
+        yield Input(placeholder="Search movies/series on MovieBox... (Press Enter)", id="search_box")
+        yield ListView(id="results_list")
+        yield Footer()
+
+    async def on_input_submitted(self, event: Input.Submitted):
+        query = event.value.strip()
+        if not query:
+            return
+            
+        list_view = self.query_one("#results_list", ListView)
+        await list_view.clear()
+        list_view.append(ListItem(Label(f"[bold yellow]Searching MovieBox for '{query}'...[/bold yellow]")))
+        
+        try:
+            # MovieBox API को कॉल करना (Part 2 का इस्तेमाल करके)
+            results = await self.client.search(query)
+            await list_view.clear()
+            
+            if not results:
+                list_view.append(ListItem(Label("[bold red]No results found or API blocked![/bold red]")))
+                return
+            
+            # रिज़ल्ट्स को UI में दिखाना और SQLite कैशे में सेव करना
+            for item in results:
+                title = item.get("title", "Unknown")
+                year = item.get("year", "N/A")
+                m_type = item.get("type", "Movie")
+                movie_id = item.get("id", "")
+                
+                icon = "📺" if m_type == "Series" else "🎬"
+                
+                list_view.append(
+                    ListItem(
+                        Label(f"{icon} [bold white]{title}[/bold white] ({year}) - {m_type}")
+                    )
+                )
+                
+                # बैकग्राउंड में SQLite में मूवी का डेटा सेव करें (Part 1 का इस्तेमाल करके)
+                if movie_id:
+                    self.cache.save_movie(
+                        movie_id=movie_id,
+                        title=title,
+                        source_url=f"moviebox://{movie_id}",
+                        year=year
+                    )
+                    
+        except Exception as e:
+            await list_view.clear()
+            list_view.append(ListItem(Label(f"[bold red]API Error:[/bold red] {str(e)}")))
+
+    def action_clear_cache(self):
+        self.cache.clean_expired()
+        self.notify("Cache cleaned successfully!")
+                                                  
