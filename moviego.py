@@ -463,4 +463,20 @@ class MovieGoApp(App):
     def action_clear_cache(self):
         self.cache.clean_expired()
         self.notify("Cache cleaned successfully!")
-                                                  
+      # ==========================================
+# PART 4: Execution & Main Runner
+# ==========================================
+
+def main():
+    """Entry point for MovieGo TUI"""
+    try:
+        app = MovieGoApp()
+        app.run()
+    except KeyboardInterrupt:
+        print("\nExiting MovieGo...")
+    except Exception as e:
+        print(f"\nCritical Error: {str(e)}")
+
+if __name__ == "__main__":
+    main()
+                
